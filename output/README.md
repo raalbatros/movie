@@ -5,8 +5,8 @@ Auto-generated nightly by GitHub Actions using TMDB data.
 ## Stats
 | Metric | Value |
 |--------|-------|
-| **Total movies** | 444 |
-| **Last updated** | 2026-04-28 20:00 UTC |
+| **Total movies** | 452 |
+| **Last updated** | 2026-04-29 05:21 UTC |
 | **Sources** | 7 embed providers |
 
 ## Playlist URL
@@ -18,18 +18,18 @@ https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/output/movies.m3u
 ## Genre Breakdown
 | Genre | Count |
 |-------|-------|
-| Drama | 172 |
-| Action | 143 |
-| Adventure | 114 |
-| Thriller | 110 |
-| Comedy | 102 |
+| Drama | 175 |
+| Action | 149 |
+| Thriller | 113 |
+| Adventure | 113 |
+| Comedy | 101 |
 | Fantasy | 76 |
-| Romance | 74 |
-| Horror | 70 |
+| Romance | 75 |
+| Horror | 71 |
 | Sci-Fi | 70 |
-| Crime | 69 |
+| Crime | 70 |
 | Animation | 68 |
-| War | 57 |
+| War | 62 |
 
 ## Stream Sources
 | Source | Base URL |
