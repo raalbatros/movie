@@ -4,7 +4,7 @@ const fs = require('fs');
 const API_KEY = process.env.TMDB_API_KEY;
 
 if (!API_KEY) {
-    console.error("❌ API anahtarı yok!");
+    console.error("❌ TMDB API anahtarı bulunamadı!");
     process.exit(1);
 }
 
@@ -13,17 +13,18 @@ if (!fs.existsSync('filmler')) {
 }
 
 const VIDMODY_URL = "https://vidmody.com/vs";
-const failedLinks = new Set();
 const processedMovies = new Set();
+const failedLinks = new Set();
 
 async function getImdbId(tmdbId) {
     if (processedMovies.has(tmdbId)) return null;
     try {
         const url = `https://api.themoviedb.org/3/movie/${tmdbId}/external_ids?api_key=${API_KEY}`;
         const response = await axios.get(url);
-        if (response.data.imdb_id) {
+        const imdbId = response.data.imdb_id;
+        if (imdbId) {
             processedMovies.add(tmdbId);
-            return response.data.imdb_id;
+            return imdbId;
         }
         return null;
     } catch {
@@ -34,10 +35,8 @@ async function getImdbId(tmdbId) {
 async function checkLink(url) {
     if (failedLinks.has(url)) return false;
     try {
-        const response = await axios.head(url, { timeout: 5000 });
-        if (response.status === 200) return true;
-        failedLinks.add(url);
-        return false;
+        await axios.head(url, { timeout: 5000 });
+        return true;
     } catch {
         failedLinks.add(url);
         return false;
@@ -48,11 +47,12 @@ async function scrape() {
     console.log("🎬 FİLM ARŞİVİ TARANIYOR...\n");
     const movies = [];
     
-    // VİZYONDAKİLER
+    // 1. VİZYONDAKİLER (Tüm sayfalar)
     console.log("🆕 Vizyondaki filmler taranıyor...");
-    for (let page = 1; page <= 5; page++) {
+    let vizyonPage = 1;
+    while (vizyonPage <= 5) {
         try {
-            const url = `https://api.themoviedb.org/3/movie/now_playing?api_key=${API_KEY}&language=tr&page=${page}`;
+            const url = `https://api.themoviedb.org/3/movie/now_playing?api_key=${API_KEY}&language=tr&page=${vizyonPage}`;
             const response = await axios.get(url);
             if (response.data.results.length === 0) break;
             for (const movie of response.data.results) {
@@ -73,17 +73,20 @@ async function scrape() {
                 }
                 await new Promise(r => setTimeout(r, 30));
             }
+            vizyonPage++;
         } catch(e) { break; }
     }
     
-    // YILLARA GÖRE (1990-2026)
-    const years = [];
-    for (let y = 2026; y >= 1990; y--) years.push(y);
+    // 2. YILLARA GÖRE TARAMA (1980-2026, her yıl 10 sayfa)
+    console.log("\n📅 Yıllara göre filmler taranıyor...");
+    let totalMovies = 0;
     
-    for (const year of years) {
+    for (let year = 2026; year >= 1980; year--) {
         console.log(`📅 ${year} taranıyor...`);
+        let yearCount = 0;
+        
         for (let page = 1; page <= 10; page++) {
-            const url = `https://api.themoviedb.org/3/discover/movie?api_key=${API_KEY}&language=tr&sort_by=popularity.desc&primary_release_year=${year}&page=${page}&vote_count.gte=50`;
+            const url = `https://api.themoviedb.org/3/discover/movie?api_key=${API_KEY}&language=tr&sort_by=popularity.desc&primary_release_year=${year}&page=${page}`;
             try {
                 const response = await axios.get(url);
                 if (response.data.results.length === 0) break;
@@ -100,14 +103,19 @@ async function scrape() {
                                 rating: movie.vote_average || 0,
                                 isTurkish: movie.original_language === "tr"
                             });
-                            console.log(`   ✓ ${movie.title} (${year}) ⭐ ${movie.vote_average}`);
+                            yearCount++;
+                            console.log(`   ✓ ${movie.title} ⭐ ${movie.vote_average || "?"}`);
                         }
                     }
                     await new Promise(r => setTimeout(r, 25));
                 }
             } catch(e) { break; }
         }
+        console.log(`   ${year} için ${yearCount} film eklendi`);
+        totalMovies += yearCount;
     }
+    
+    console.log(`\n📊 Toplam taranan film: ${movies.length}`);
     
     // M3U OLUŞTUR
     const vizyon = movies.filter(m => m.year === "Vizyonda");
@@ -122,8 +130,7 @@ async function scrape() {
         vizyon.sort((a, b) => b.rating - a.rating);
         m3u += `# 🆕 VİZYONDAKİLER (${vizyon.length} adet)\n`;
         for (const m of vizyon) {
-            m3u += `#EXTINF:-1 group-title="Vizyondakiler" tvg-logo="${m.poster}", ${m.title} ⭐ ${m.rating}\n`;
-            m3u += `${m.link}\n`;
+            m3u += `#EXTINF:-1 group-title="Vizyondakiler" tvg-logo="${m.poster}", ${m.title} ⭐ ${m.rating}\n${m.link}\n`;
         }
         m3u += `\n`;
     }
@@ -132,8 +139,7 @@ async function scrape() {
         turkish.sort((a, b) => b.rating - a.rating);
         m3u += `# 🇹🇷 YERLİ FİLMLER (${turkish.length} adet)\n`;
         for (const m of turkish) {
-            m3u += `#EXTINF:-1 group-title="Yerli Filmler" tvg-logo="${m.poster}", ${m.title} (${m.year}) ⭐ ${m.rating}\n`;
-            m3u += `${m.link}\n`;
+            m3u += `#EXTINF:-1 group-title="Yerli Filmler" tvg-logo="${m.poster}", ${m.title} (${m.year}) ⭐ ${m.rating}\n${m.link}\n`;
         }
         m3u += `\n`;
     }
@@ -148,14 +154,13 @@ async function scrape() {
         yearGroups[year].sort((a, b) => b.rating - a.rating);
         m3u += `# 🎬 ${year} (${yearGroups[year].length} adet)\n`;
         for (const m of yearGroups[year]) {
-            m3u += `#EXTINF:-1 group-title="${year}" tvg-logo="${m.poster}", ${m.title} ⭐ ${m.rating}\n`;
-            m3u += `${m.link}\n`;
+            m3u += `#EXTINF:-1 group-title="${year}" tvg-logo="${m.poster}", ${m.title} ⭐ ${m.rating}\n${m.link}\n`;
         }
         m3u += `\n`;
     }
     
     fs.writeFileSync('filmler/films.m3u', m3u);
-    console.log(`\n✅ TAMAMLANDI! Toplam: ${movies.length} film`);
+    console.log(`\n✅ TAMAMLANDI! ${movies.length} film kaydedildi.`);
 }
 
 scrape().catch(console.error);
