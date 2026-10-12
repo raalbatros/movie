@@ -1,309 +1,755 @@
-import os
-import re
-import time
-import random
-import requests
-from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
+const { sortStreamsByQuality } = require("../shared/quality.js");
+const { loadConfig, val, wrapAll } = require("../shared/config.js");
 
-BASE_URL = "https://www.hdfilmizle.life"
-OUTPUT_FILE = "hdfilmizle.m3u"
-
-DIZI_BASLANGIC = int(os.getenv("DIZI_BASLANGIC", "1"))
-DIZI_BITIS = int(os.getenv("DIZI_BITIS", "50"))
-
-FILM_BASLANGIC = int(os.getenv("FILM_BASLANGIC", "1"))
-FILM_BITIS = int(os.getenv("FILM_BITIS", "975"))
-
-WORKER_COUNT = int(os.getenv("WORKER_COUNT", "8"))
-REQUEST_TIMEOUT = 20
-MAX_RETRIES = 3
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Referer": BASE_URL,
-    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+var _cfgReady = null;
+function cfgReady() {
+    if (!_cfgReady) {
+        _cfgReady = loadConfig().then(function () {
+            var v = val('urls.movies.hdfilmizle.bases');
+            if (v && Object.prototype.toString.call(v) === '[object Array]' && v.length) {
+                BASES = v.map(function (s) { return String(s).replace(/\/+$/, ''); });
+            }
+        });
+    }
+    return _cfgReady;
 }
 
-session = requests.Session()
-session.headers.update(HEADERS)
+/**
+ * Anthology - HDFilmIzle Provider (Vip + Ink)
+ * https://www.hdfilmizle.vip / https://www.hdfilmizle.ink
+ * Film arşivi; Vidrame, Vidmoxy ve FastPlay 1080p HLS master akışları (TR/EN altyazı).
+ */
+
+var BASES = ['https://www.hdfilmizle.vip', 'https://www.hdfilmizle.ink'];
+var TMDB_API_KEY = '500330721680edb6d5f7f12ba7cd9023';
+
+var UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+function ultraClean(str) {
+    if (!str) return '';
+    return str.toString().toLowerCase()
+        .replace(/[ıİ]/g, 'i').replace(/[üÜ]/g, 'u').replace(/[öÖ]/g, 'o')
+        .replace(/[şŞ]/g, 's').replace(/[ğĞ]/g, 'g').replace(/[çÇ]/g, 'c')
+        .replace(/[^a-z0-9]/g, '')
+        .trim();
+}
+
+function fetchWithTimeout(url, options, ms) {
+    var opts = options || {};
+    try {
+        if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+            opts.signal = AbortSignal.timeout(ms || 15000);
+        }
+    } catch (e) {}
+    return fetch(url, opts);
+}
+
+function headersFor(base) {
+    return {
+        'User-Agent': UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
+        'Referer': base + '/'
+    };
+}
+
+function base64Decode(str) {
+    try {
+        if (typeof atob === 'function') return atob(str);
+        if (typeof Buffer !== 'undefined') return Buffer.from(str, 'base64').toString('binary');
+    } catch (e) {}
+    return '';
+}
+
+function rot13(str) {
+    return str.replace(/[a-zA-Z]/g, function(c) {
+        var code = c.charCodeAt(0);
+        if (code >= 65 && code <= 90) return String.fromCharCode(((code - 65 + 13) % 26) + 65);
+        if (code >= 97 && code <= 122) return String.fromCharCode(((code - 97 + 13) % 26) + 97);
+        return c;
+    });
+}
+
+function decodeVidmoxy(encoded) {
+    try {
+        var b64 = base64Decode(encoded);
+        if (!b64) return null;
+        var reversed = b64.split('').reverse().join('');
+        return rot13(reversed);
+    } catch (e) {
+        return null;
+    }
+}
+
+function decodeVidrameXor(d, k) {
+    try {
+        var o = '';
+        for (var i = 0; i < d.length; i++) {
+            o += String.fromCharCode(d[i] ^ k.charCodeAt(i % k.length) ^ ((i * 17 + 13) & 255));
+        }
+        return o;
+    } catch (e) {
+        return null;
+    }
+}
 
 
-def get_soup(url):
-    for attempt in range(MAX_RETRIES):
-        try:
-            r = session.get(url, timeout=REQUEST_TIMEOUT)
-            if r.status_code == 200:
-                return BeautifulSoup(r.content, "lxml")
+async function resolveTmdbInfo(id) {
+    try {
+        var cleanId = String(id || '').trim();
+        if (cleanId.includes(':')) cleanId = cleanId.split(':')[0];
+        var title = '';
+        var origTitle = '';
+        var year = null;
+        if (cleanId.startsWith('tt')) {
+            var findRes = await fetchWithTimeout('https://api.themoviedb.org/3/find/' + cleanId + '?api_key=' + TMDB_API_KEY + '&external_source=imdb_id', {}, 10000);
+            if (findRes.ok) {
+                var fd = await findRes.json();
+                var match = (fd.movie_results && fd.movie_results[0]) || (fd.tv_results && fd.tv_results[0]);
+                if (match) {
+                    title = match.title || match.name || '';
+                    origTitle = match.original_title || match.original_name || '';
+                    var rDate = match.release_date || match.first_air_date || '';
+                    if (rDate) year = parseInt(rDate.split('-')[0], 10);
+                }
+            }
+        } else {
+            var tRes = await fetchWithTimeout('https://api.themoviedb.org/3/movie/' + cleanId + '?api_key=' + TMDB_API_KEY + '&language=tr-TR', {}, 10000);
+            if (tRes.ok) {
+                var td = await tRes.json();
+                title = td.title || '';
+                origTitle = td.original_title || '';
+                var rd = td.release_date || '';
+                if (rd) year = parseInt(rd.split('-')[0], 10);
+            }
+        }
+        return { title: title, origTitle: origTitle, year: year };
+    } catch (e) {
+        return { title: '', origTitle: '', year: null };
+    }
+}
 
-            if r.status_code in (403, 429, 503):
-                wait = 5 * (attempt + 1)
-                print(f"[BEKLE] {r.status_code} - {url} - {wait} sn")
-                time.sleep(wait)
-                continue
+function parseCards(html, base) {
+    var out = [];
+    var seen = new Set();
+    var vipRe = /<a[^>]+href="(\/[^"\/]+\/)"[^>]+title="([^"]+)"[^>]+class="[^"]*poster[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+    var vm;
+    while ((vm = vipRe.exec(html)) !== null) {
+        var href = base + vm[1];
+        if (seen.has(href)) continue;
+        var title = vm[2].trim();
+        var imgM = vm[3].match(/data-src="([^"]+)"/i) || vm[3].match(/data-srcset="([^",\s]+)/i) || vm[3].match(/src="([^"]+)"/i);
+        var poster = imgM ? (imgM[1].startsWith('http') ? imgM[1] : (base + imgM[1])) : '';
+        seen.add(href);
+        out.push({ title: title, href: href, poster: poster, base: base });
+    }
+    var re = /<article[^>]+class="[^"]*\bitem\b[^"]*"[^>]*>([\s\S]*?)<\/article>/gi;
+    var m;
+    while ((m = re.exec(html)) !== null) {
+        var inner = m[1];
+        var hrefMatch = inner.match(/<div[^>]+class="[^"]*poster[^"]*"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"/i) ||
+                        inner.match(/<a[^>]+href="([^"]+\/film\/[^"]+)"[^>]*>/i);
+        if (!hrefMatch) continue;
+        var href = hrefMatch[1];
+        if (href.startsWith('/')) href = base + href;
+        if (!href.startsWith('http') || seen.has(href)) continue;
+        var titleMatch = inner.match(/<h[23][^>]*>([\s\S]*?)<\/h[23]>/i);
+        var imgMatch = inner.match(/<img[^>]+data-src="([^"]+)"/i) || inner.match(/<img[^>]+src="(https?:[^"]+)"/i);
+        var altMatch = inner.match(/<img[^>]+alt="([^"]*)"/i);
+        var title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : (altMatch ? altMatch[1].trim() : '');
+        if (!title) continue;
+        seen.add(href);
+        out.push({ title: title, href: href, poster: imgMatch ? imgMatch[1] : '', base: base });
+    }
+    return out;
+}
 
-        except requests.RequestException as e:
-            print(f"[HATA] {url}: {e}")
-            time.sleep(3)
+async function searchVip(query) {
+    try {
+        var base = (BASES && BASES[0]) || 'https://www.hdfilmizle.vip';
+        var form = new URLSearchParams();
+        form.append('query', query);
+        var res = await fetchWithTimeout(base + '/search/', {
+            method: 'POST',
+            headers: {
+                'User-Agent': UA,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': base + '/'
+            },
+            body: form.toString()
+        }, 15000);
+        if (!res.ok) return [];
+        var items = await res.json();
+        if (!Array.isArray(items)) return [];
+        var out = [];
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            if (!item || !item.slug) continue;
+            var href = base + '/' + item.slug.replace(/^\/+|\/+$/g, '') + '/';
+            var poster = item.thumb_url ? (item.thumb_url.startsWith('http') ? item.thumb_url : (base + item.thumb_url)) : '';
+            out.push({
+                title: item.name || '',
+                href: href,
+                poster: poster,
+                base: base,
+                year: item.year ? parseInt(item.year, 10) : null
+            });
+        }
+        return out;
+    } catch (e) {
+        return [];
+    }
+}
 
-    return None
+async function searchAll(query) {
+    var vipCards = await searchVip(query);
+    if (vipCards && vipCards.length > 0) return vipCards;
+    var all = [];
+    for (var i = 0; i < BASES.length; i++) {
+        try {
+            var base = BASES[i];
+            var res = await fetchWithTimeout(base + '/?s=' + encodeURIComponent(query), { headers: headersFor(base) }, 15000);
+            if (!res.ok) continue;
+            var cards = parseCards(await res.text(), base);
+            for (var j = 0; j < cards.length; j++) all.push(cards[j]);
+            if (all.length > 0) break;
+        } catch (e) {}
+    }
+    return all;
+}
 
+function pickBest(cards, title, year) {
+    if (!cards || cards.length === 0) return null;
+    var cleanTarget = ultraClean(title);
+    if (year) {
+        for (var y = 0; y < cards.length; y++) {
+            if (cards[y].year && cards[y].year === year) {
+                var cy = ultraClean(cards[y].title);
+                if (cy === cleanTarget || cy.includes(cleanTarget) || cleanTarget.includes(cy)) {
+                    return cards[y];
+                }
+            }
+        }
+    }
+    for (var i = 0; i < cards.length; i++) {
+        if (ultraClean(cards[i].title) === cleanTarget) return cards[i];
+    }
+    for (var j = 0; j < cards.length; j++) {
+        var c = ultraClean(cards[j].title);
+        if (c.includes(cleanTarget) || cleanTarget.includes(c)) return cards[j];
+    }
+    return cards[0];
+}
 
-def absolute_url(path):
-    if not path:
-        return ""
-    return path if path.startswith("http") else BASE_URL + path
+function spgDecode(n, o) {
+    try {
+        var a, b;
+        if (typeof Buffer !== 'undefined') {
+            a = Buffer.from(n, 'base64').toString('binary');
+            b = Buffer.from(o, 'base64').toString('binary');
+        } else if (typeof atob === 'function') {
+            a = atob(n);
+            b = atob(o);
+        } else {
+            return null;
+        }
+        var s = '';
+        for (var i = 0; i < a.length; i++) {
+            s += String.fromCharCode(a.charCodeAt(i) ^ b.charCodeAt(i % b.length));
+        }
+        return s.split('|')[0];
+    } catch (e) {
+        return null;
+    }
+}
 
+async function resolveVidrame(vidrameUrl, ref) {
+    try {
+        var vRes = await fetchWithTimeout(vidrameUrl, {
+            headers: { 'User-Agent': UA, 'Referer': ref || ((BASES && BASES[0]) || 'https://www.hdfilmizle.vip') + '/' }
+        }, 15000);
+        if (!vRes.ok) return null;
+        var vHtml = await vRes.text();
 
-def extract_stream(page_url):
-    soup = get_soup(page_url)
-    if not soup:
-        return None
+        var streamUrl = '';
+        var srcMatch = vHtml.match(/sources\s*:\s*\[\{\s*file\s*:\s*\(function[\s\S]*?\)\((\[[^\]]+\])\s*,\s*["']([^"']+)["']\)/i);
+        if (srcMatch) {
+            try {
+                var d = JSON.parse(srcMatch[1]);
+                var k = srcMatch[2];
+                streamUrl = decodeVidrameXor(d, k);
+            } catch (e) {}
+        }
+        if (!streamUrl) {
+            var anySrc = vHtml.match(/\(\s*(\[[0-9,\s]+\])\s*,\s*["']([a-zA-Z0-9]+)["']\s*\)/);
+            if (anySrc) {
+                try {
+                    streamUrl = decodeVidrameXor(JSON.parse(anySrc[1]), anySrc[2]);
+                } catch (e) {}
+            }
+        }
+        if (!streamUrl || !streamUrl.startsWith('http')) return null;
 
-    iframe = soup.find("iframe", class_="vpx")
-    if not iframe:
-        return None
+        var subs = [];
+        var trMatch = vHtml.match(/configs\.tracks\s*=\s*(\[[\s\S]*?\]);/);
+        if (trMatch) {
+            try {
+                var trList = JSON.parse(trMatch[1]);
+                for (var ti = 0; ti < trList.length; ti++) {
+                    var t = trList[ti];
+                    if (t && t.fx && t.fx.d && t.fx.k) {
+                        var sUrl = decodeVidrameXor(t.fx.d, t.fx.k);
+                        if (sUrl && sUrl.startsWith('http')) {
+                            var lCode = t.language === 'tur' ? 'tr' : (t.language === 'eng' ? 'en' : (t.language || 'tr'));
+                            subs.push({
+                                id: t.language || 'sub_' + ti,
+                                url: sUrl,
+                                file: sUrl,
+                                link: sUrl,
+                                lang: t.language || 'tur',
+                                language: lCode,
+                                label: t.label || (lCode === 'tr' ? 'Türkçe' : 'English'),
+                                name: t.label || (lCode === 'tr' ? 'Türkçe' : 'English'),
+                                title: t.label || (lCode === 'tr' ? 'Türkçe' : 'English'),
+                                format: 'vtt',
+                                type: 'text/vtt',
+                                mimeType: 'text/vtt'
+                            });
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+        return { streamUrl: streamUrl, subtitles: subs };
+    } catch (e) {
+        return null;
+    }
+}
 
-    src = iframe.get("data-src") or iframe.get("src")
-    if not src or "vidrame.pro" not in src:
-        return None
+async function resolveVidmoxy(vidmoxyUrl, ref) {
+    try {
+        var mRes = await fetchWithTimeout(vidmoxyUrl, {
+            headers: { 'User-Agent': UA, 'Referer': ref || ((BASES && BASES[0]) || 'https://www.hdfilmizle.vip') + '/' }
+        }, 15000);
+        if (!mRes.ok) return null;
+        var mHtml = await mRes.text();
 
-    vid_match = re.search(r"vidrame\.pro/vr/(?:get/)?([a-f0-9]{8})", src)
-    if not vid_match:
-        return None
+        var streamUrl = '';
+        var eeMatch = mHtml.match(/EE\.dd\s*\(\s*["']([^"']+)["']\s*\)/i);
+        if (eeMatch) {
+            streamUrl = decodeVidmoxy(eeMatch[1]);
+        }
+        if (!streamUrl || !streamUrl.startsWith('http')) return null;
 
-    vid_id = vid_match.group(1)
+        var subs = [];
+        var trMatch = mHtml.match(/tracks\s*:\s*(\[[\s\S]*?\])/);
+        if (trMatch) {
+            try {
+                var trList = JSON.parse(trMatch[1]);
+                for (var ti = 0; ti < trList.length; ti++) {
+                    var t = trList[ti];
+                    if (t && t.file && typeof t.file === 'string' && t.file.indexOf('.vtt') !== -1) {
+                        var sUrl = t.file.startsWith('http') ? t.file : ('https://vidmoxy.net' + (t.file.startsWith('/') ? '' : '/') + t.file);
+                        var lCode = t.language === 'tur' ? 'tr' : (t.language === 'eng' ? 'en' : (t.language || 'tr'));
+                        subs.push({
+                            id: t.language || 'sub_' + ti,
+                            url: sUrl,
+                            file: sUrl,
+                            link: sUrl,
+                            lang: t.language || 'tur',
+                            language: lCode,
+                            label: t.label || (lCode === 'tr' ? 'Türkçe' : 'English'),
+                            name: t.label || (lCode === 'tr' ? 'Türkçe' : 'English'),
+                            title: t.label || (lCode === 'tr' ? 'Türkçe' : 'English'),
+                            format: 'vtt',
+                            type: 'text/vtt',
+                            mimeType: 'text/vtt'
+                        });
+                    }
+                }
+            } catch (e) {}
+        }
+        return { streamUrl: streamUrl, subtitles: subs };
+    } catch (e) {
+        return null;
+    }
+}
 
-    quality_match = re.search(r"/(\d+)\.txt", src)
-    quality = quality_match.group(1) if quality_match else "1080"
+async function resolveFastplay(fastplayUrl, fastplayRef) {
+    try {
+        var fpRes = await fetchWithTimeout(fastplayUrl, {
+            headers: { 'User-Agent': UA, 'Referer': fastplayRef }
+        }, 15000);
+        if (!fpRes.ok) return null;
+        var fpHtml = await fpRes.text();
+        var manMatch = fpHtml.match(/(?:src|stream)\s*:\s*"(\/manifests\/[^"]+)"/);
+        if (!manMatch) return null;
+        var fpOrigin = fastplayUrl.match(/^(https?:\/\/[^/]+)/)[1];
+        var manifestUrl = fpOrigin + manMatch[1].replace(/&amp;/g, '&');
 
-    txt_url = f"https://vidrame.pro/vr/get/{vid_id}/{quality}.txt"
+        var subs = [];
+        var subMatch = fpHtml.match(/subtitles\s*:\s*(\[[\s\S]*?\])/);
+        if (subMatch) {
+            try {
+                var arr = JSON.parse(subMatch[1]);
+                for (var si = 0; si < arr.length; si++) {
+                    var item = arr[si];
+                    if (item && item.file && item.file.indexOf('.vtt') !== -1) {
+                        var lCode = item.lang === 'tur' ? 'tr' : (item.lang === 'eng' ? 'en' : (item.lang || 'tr'));
+                        subs.push({
+                            id: item.lang || 'sub_' + si,
+                            url: item.file,
+                            file: item.file,
+                            link: item.file,
+                            lang: item.lang || 'tur',
+                            language: lCode,
+                            label: item.label || (lCode === 'tr' ? 'Türkçe' : 'English'),
+                            name: item.label || (lCode === 'tr' ? 'Türkçe' : 'English'),
+                            title: item.label || (lCode === 'tr' ? 'Türkçe' : 'English'),
+                            format: 'vtt',
+                            type: 'text/vtt',
+                            mimeType: 'text/vtt'
+                        });
+                    }
+                }
+            } catch (e) {}
+        }
+        if (subs.length === 0) {
+            var subRe = /"file"\s*:\s*"(https?:[^"]+\.vtt)"\s*,\s*"label"\s*:\s*"([^"]+)"\s*,\s*"lang"\s*:\s*"([^"]+)"/gi;
+            var sm;
+            while ((sm = subRe.exec(fpHtml)) !== null) {
+                var langCode = sm[3] === 'tur' ? 'tr' : (sm[3] === 'eng' ? 'en' : sm[3]);
+                subs.push({
+                    id: sm[3],
+                    url: sm[1].replace(/\\\//g, '/'),
+                    file: sm[1].replace(/\\\//g, '/'),
+                    link: sm[1].replace(/\\\//g, '/'),
+                    lang: sm[3],
+                    language: langCode,
+                    label: sm[2],
+                    name: sm[2],
+                    title: sm[2],
+                    format: 'vtt',
+                    type: 'text/vtt',
+                    mimeType: 'text/vtt'
+                });
+            }
+        }
+        return { manifestUrl: manifestUrl, subtitles: subs, referer: fpRes.url || fastplayUrl };
+    } catch (e) {
+        return null;
+    }
+}
 
-    try:
-        r = session.get(txt_url, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            return None
+async function extractStreamsFromFilmPage(pageUrl, base) {
+    var streams = [];
+    try {
+        var res = await fetchWithTimeout(pageUrl, { headers: headersFor(base) }, 15000);
+        if (!res.ok) return [];
+        var html = await res.text();
 
-        text = r.text.strip()
+        // 1. Check for `let parts = [...]` on hdfilmizle.vip
+        var partsMatch = html.match(/let\s+parts\s*=\s*(\[[\s\S]*?\]);/);
+        if (partsMatch) {
+            try {
+                var parts = JSON.parse(partsMatch[1]);
+                if (Array.isArray(parts) && parts.length > 0) {
+                    for (var pi = 0; pi < parts.length; pi++) {
+                        var part = parts[pi];
+                        if (!part || !part.data) continue;
+                        var ifm = part.data.match(/src=["']([^"']+)["']/i);
+                        if (!ifm) continue;
+                        var iframeUrl = ifm[1].replace(/\\\//g, '/');
+                        var pLang = part.lang === 'tr' ? 'TR Dublaj' : (part.lang === 'dual' ? 'Dual (TR/EN)' : 'TR Altyazı');
 
-        m3u8_match = re.search(r'https?://[^\s"\']+\.m3u8[^\s"\']*', text)
-        if m3u8_match:
-            return m3u8_match.group(0)
-
-        if text.startswith("#EXTM3U"):
-            return txt_url
-
-        return None
-
-    except requests.RequestException:
-        return None
-
-
-def make_entry(title, poster, stream_url, group):
-    title = re.sub(r'[\r\n"]+', " ", title).strip()
-    poster = poster.replace('"', "")
-
-    return (
-        f'#EXTINF:-1 tvg-id="" tvg-name="{title}" '
-        f'tvg-logo="{poster}" group-title="{group}",{title}\n'
-        f"{stream_url}\n"
-    )
-
-
-def process_episode(dizi_adi, poster_url, bolum_url):
-    full_url = absolute_url(bolum_url)
-    stream = extract_stream(full_url)
-
-    if not stream:
-        return None
-
-    sezon_match = re.search(r"/sezon-(\d+)/bolum-(\d+)/", full_url)
-    if sezon_match:
-        sezon, bolum = sezon_match.groups()
-        baslik = f"{dizi_adi} S{sezon.zfill(2)}B{bolum.zfill(2)}"
-    else:
-        baslik = dizi_adi
-
-    return make_entry(
-        f"TR: {baslik}",
-        poster_url,
-        stream,
-        "Dizi - HDFilmizle"
-    )
-
-
-def get_series_from_page(page_num):
-    url = f"{BASE_URL}/yabanci-dizi-izle-2/page/{page_num}/"
-    soup = get_soup(url)
-
-    if not soup:
-        return []
-
-    container = soup.find("div", id="moviesListResult")
-    if not container:
-        return []
-
-    cards = container.find_all("a", class_="poster")
-    entries = []
-
-    for card in cards:
-        try:
-            dizi_url = absolute_url(card.get("href"))
-            if not dizi_url:
-                continue
-
-            img = card.find("img", class_="lazyload")
-            poster = absolute_url(
-                img.get("data-src") or img.get("src") if img else ""
-            )
-
-            title_tag = card.find("h2", class_="title")
-            dizi_adi = title_tag.text.strip() if title_tag else "Bilinmeyen Dizi"
-
-            detail_soup = get_soup(dizi_url)
-            if not detail_soup:
-                continue
-
-            episode_links = detail_soup.find_all(
-                "a", href=re.compile(r"/sezon-\d+/bolum-\d+/")
-            )
-
-            seen = set()
-
-            for ep in episode_links:
-                href = ep.get("href")
-                if not href or href in seen:
-                    continue
-
-                seen.add(href)
-                entry = process_episode(dizi_adi, poster, href)
-
-                if entry:
-                    entries.append(entry)
-
-        except Exception as e:
-            print(f"[DIZI HATA] {card.get('href')}: {e}")
-
-    return entries
-
-
-def process_movie(card):
-    try:
-        title_tag = card.find("h2", class_="title")
-        title = title_tag.text.strip() if title_tag else "Bilinmeyen Film"
-
-        img = card.find("img", class_="lazyload")
-        poster = absolute_url(
-            img.get("data-src") or img.get("src") if img else ""
-        )
-
-        movie_url = absolute_url(card.get("href"))
-        if not movie_url:
-            return None
-
-        stream = extract_stream(movie_url)
-        if not stream:
-            return None
-
-        return make_entry(
-            f"TR: {title}",
-            poster,
-            stream,
-            "Film - HDFilmizle"
-        )
-
-    except Exception as e:
-        print(f"[FILM HATA] {card.get('href')}: {e}")
-        return None
-
-
-def get_movies_from_page(page_num):
-    url = f"{BASE_URL}/page/{page_num}/"
-    soup = get_soup(url)
-
-    if not soup:
-        return []
-
-    container = soup.find("div", id="moviesListResult")
-    if not container:
-        return []
-
-    cards = container.find_all("a", class_="poster")
-    entries = []
-
-    for card in cards:
-        entry = process_movie(card)
-        if entry:
-            entries.append(entry)
-
-    return entries
-
-
-def run_jobs(kind, start_page, end_page, worker_function):
-    results = []
-
-    with ThreadPoolExecutor(max_workers=WORKER_COUNT) as executor:
-        futures = {
-            executor.submit(worker_function, page): page
-            for page in range(start_page, end_page + 1)
+                        if (iframeUrl.indexOf('vidrame.') !== -1) {
+                            var vr = await resolveVidrame(iframeUrl, pageUrl);
+                            if (vr && vr.streamUrl) {
+                                var vrHeaders = { 'User-Agent': 'ExoPlayerLib/2.19.1', 'Referer': 'https://vidrame.pro/' };
+                                streams.push({
+                                    name: 'HDFilmIzle',
+                                    title: '⌜ HDFilmIzle ⌟ | Vidrame (' + pLang + ' - 1080p HLS)',
+                                    url: vr.streamUrl + (vr.streamUrl.indexOf('.m3u8') !== -1 ? '' : '#.m3u8'),
+                                    quality: '1080p',
+                                    provider: 'hdfilmizle',
+                                    headers: vrHeaders,
+                                    format: 'hls',
+                                    isHls: true,
+                                    behaviorHints: { notWebReady: true, proxyHeaders: { request: vrHeaders } },
+                                    subtitles: vr.subtitles || []
+                                });
+                            }
+                        } else if (iframeUrl.indexOf('vidmoxy.') !== -1) {
+                            var vm = await resolveVidmoxy(iframeUrl, pageUrl);
+                            if (vm && vm.streamUrl) {
+                                var vmHeaders = { 'User-Agent': 'ExoPlayerLib/2.19.1', 'Referer': 'https://vidmoxy.net/' };
+                                streams.push({
+                                    name: 'HDFilmIzle',
+                                    title: '⌜ HDFilmIzle ⌟ | Vidmoxy (' + pLang + ' - 1080p HLS)',
+                                    url: vm.streamUrl + (vm.streamUrl.indexOf('.m3u8') !== -1 ? '' : '#.m3u8'),
+                                    quality: '1080p',
+                                    provider: 'hdfilmizle',
+                                    headers: vmHeaders,
+                                    format: 'hls',
+                                    isHls: true,
+                                    behaviorHints: { notWebReady: true, proxyHeaders: { request: vmHeaders } },
+                                    subtitles: vm.subtitles || []
+                                });
+                            }
+                        } else if (iframeUrl.indexOf('fastplay.') !== -1 || iframeUrl.indexOf('setplay.') !== -1) {
+                            var fastUrl = iframeUrl;
+                            if (iframeUrl.indexOf('setplay.') !== -1) {
+                                var spRes = await fetchWithTimeout(iframeUrl, { headers: { 'User-Agent': UA, 'Referer': pageUrl } }, 15000);
+                                if (spRes.ok) {
+                                    var spHtml = await spRes.text();
+                                    var cerMatch = spHtml.match(/SPG\.cerceve\(\s*"[^"]*"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)/);
+                                    fastUrl = cerMatch ? spgDecode(cerMatch[1], cerMatch[2]) : null;
+                                }
+                            }
+                            if (fastUrl) {
+                                var fp = await resolveFastplay(fastUrl, pageUrl);
+                                if (fp && fp.manifestUrl) {
+                                    var sHeaders = { 'User-Agent': 'ExoPlayerLib/2.19.1', 'Referer': fp.referer };
+                                    streams.push({
+                                        name: 'HDFilmIzle',
+                                        title: '⌜ HDFilmIzle ⌟ | FastPlay (' + pLang + ' - 1080p HLS)',
+                                        url: fp.manifestUrl + '#.m3u8',
+                                        quality: '1080p',
+                                        provider: 'hdfilmizle',
+                                        headers: sHeaders,
+                                        format: 'hls',
+                                        isHls: true,
+                                        behaviorHints: { notWebReady: true, proxyHeaders: { request: sHeaders } },
+                                        subtitles: fp.subtitles || []
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e) {}
         }
 
-        for future in as_completed(futures):
-            page = futures[future]
+        if (streams.length > 0) return streams;
 
-            try:
-                data = future.result()
-                results.extend(data)
-                print(f"[OK] {kind} sayfa {page}: {len(data)} kayıt")
-            except Exception as e:
-                print(f"[HATA] {kind} sayfa {page}: {e}")
+        // 2. Legacy / WordPress admin-ajax fallback (e.g. hdfilmizle.ink)
+        var ajaxMatch = html.match(/["'](https?:[^"']*wp-admin\/admin-ajax\.php)["']/);
+        var ajaxUrl = ajaxMatch ? ajaxMatch[1].replace(/\\\//g, '/') : (base + '/wp-admin/admin-ajax.php');
+        var nonceMatches = [...html.matchAll(/data-nonce="([a-z0-9]+)"/gi)].map(function(m){return m[1];});
+        var ajaxVideoNonce = (html.match(/window\.STF_AJAX[\s\S]*?video\s*:\s*"([a-z0-9]+)"/)||[])[1] || '';
+        var nonces = [];
+        if (ajaxVideoNonce) nonces.push(ajaxVideoNonce);
+        for (var _ni=0; _ni<nonceMatches.length; _ni++) if (nonces.indexOf(nonceMatches[_ni])===-1) nonces.push(nonceMatches[_ni]);
+        if (nonces.length===0) return [];
 
-    return results
+        var players = [];
+        var seenP = new Set();
+        var postIds = [];
+        var piRe = /data-post-id="([^"]+)"/gi;
+        var pim;
+        while ((pim = piRe.exec(html)) !== null) {
+            if (pim[1] && pim[1].indexOf('event') === -1 && pim[1].indexOf('$') === -1 && postIds.indexOf(pim[1]) === -1) postIds.push(pim[1]);
+        }
+        var btnRe = /data-player-name="([^"]+)"[^>]*data-part-key="([^"]*)"/gi;
+        var bm;
+        var btns = [];
+        while ((bm = btnRe.exec(html)) !== null) {
+            if (bm[1].indexOf('$') !== -1) continue;
+            btns.push({ name: bm[1], key: bm[2] || '' });
+        }
+        postIds.forEach(function(pid) {
+            btns.forEach(function(b) {
+                var k = pid + '|' + b.name + '|' + b.key;
+                if (!seenP.has(k)) {
+                    seenP.add(k);
+                    players.push({ id: pid, name: b.name, key: b.key });
+                }
+            });
+        });
+        if (players.length === 0) return [];
 
+        var seenUrls = new Set();
+        for (var i = 0; i < Math.min(players.length, 4); i++) {
+            var gotStreamForPlayer = false;
+            for (var nIdx=0; nIdx<nonces.length && !gotStreamForPlayer; nIdx++) {
+            try {
+                var pl = players[i];
+                var form = new URLSearchParams();
+                form.append('action', 'get_video_url');
+                form.append('nonce', nonces[nIdx]);
+                form.append('post_id', pl.id);
+                form.append('player_name', pl.name);
+                form.append('part_key', pl.key);
+                var aRes = await fetchWithTimeout(ajaxUrl, {
+                    method: 'POST',
+                    headers: {
+                        'User-Agent': UA,
+                        'Referer': pageUrl,
+                        'Origin': base,
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Content-Type': 'application/x-www-form-urlencoded'
+                    },
+                    body: form.toString()
+                }, 15000);
+                if (!aRes.ok) continue;
+                var aj = await aRes.json();
+                if (!aj || aj.success===false) continue;
+                var setplayUrl = aj && aj.data && ((aj.data.stream && aj.data.stream.url) || aj.data.url);
+                if (!setplayUrl) continue;
+                setplayUrl = setplayUrl.replace(/\\\//g, '/');
+                if (seenUrls.has(setplayUrl)) { gotStreamForPlayer=true; continue; }
+                seenUrls.add(setplayUrl);
 
-def main():
-    print("Tarama başlıyor...")
+                var spRes = await fetchWithTimeout(setplayUrl, {
+                    headers: { 'User-Agent': UA, 'Referer': pageUrl }
+                }, 15000);
+                if (!spRes.ok) continue;
+                var spHtml = await spRes.text();
+                var cerMatch = spHtml.match(/SPG\.cerceve\(\s*"[^"]*"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)/);
+                var fastplayUrl = cerMatch ? spgDecode(cerMatch[1], cerMatch[2]) : null;
+                if (!fastplayUrl) {
+                    var fMatch = spHtml.match(/https?:\/\/fastplay\.[a-z]+\/stfplay\.php\?[^"'<>\s\\]+/i);
+                    if (fMatch) fastplayUrl = fMatch[0].replace(/\\+/g, '');
+                }
+                if (!fastplayUrl || !fastplayUrl.startsWith('http')) continue;
 
-    series = run_jobs(
-        "Dizi",
-        DIZI_BASLANGIC,
-        DIZI_BITIS,
-        get_series_from_page
-    )
+                var fp = await resolveFastplay(fastplayUrl, spRes.url || setplayUrl);
+                if (!fp || !fp.manifestUrl) continue;
 
-    movies = run_jobs(
-        "Film",
-        FILM_BASLANGIC,
-        FILM_BITIS,
-        get_movies_from_page
-    )
+                var sHeaders = { 'User-Agent': 'ExoPlayerLib/2.19.1', 'Referer': fp.referer };
+                streams.push({
+                    name: 'HDFilmIzle',
+                    title: '⌜ HDFilmIzle ⌟ | FastPlay (1080p HLS)',
+                    url: fp.manifestUrl + '#.m3u8',
+                    quality: '1080p',
+                    provider: 'hdfilmizle',
+                    headers: sHeaders,
+                    format: 'hls',
+                    isHls: true,
+                    behaviorHints: { notWebReady: true, proxyHeaders: { request: sHeaders } },
+                    subtitles: fp.subtitles || []
+                });
+                gotStreamForPlayer=true;
+                if (streams.length > 0) break;
+            } catch (e) {}
+            }
+        }
+    } catch (e) {}
+    return streams;
+}
 
-    all_entries = series + movies
+async function getCatalog(args) {
+    try {
+        var query = (args && args.search) || (args && args.extra && args.extra.search) || (args && args.query) || '';
+        var cards = [];
+        if (query) {
+            cards = await searchAll(query);
+        } else {
+            var base = BASES[0];
+            var url = base.indexOf('vip') !== -1 ? (base + '/') : (base + '/film/');
+            var res = await fetchWithTimeout(url, { headers: headersFor(base) }, 15000);
+            if (res.ok) {
+                cards = parseCards(await res.text(), base);
+            }
+            if (cards.length === 0 && BASES[1]) {
+                var b2 = BASES[1];
+                var u2 = b2.indexOf('vip') !== -1 ? (b2 + '/') : (b2 + '/film/');
+                var r2 = await fetchWithTimeout(u2, { headers: headersFor(b2) }, 15000);
+                if (r2.ok) cards = parseCards(await r2.text(), b2);
+            }
+        }
+        var metas = cards.slice(0, 30).map(function(c) {
+            return {
+                id: 'hdfilmizle:movie:' + encodeURIComponent(c.href),
+                type: 'movie',
+                name: c.title,
+                poster: c.poster || 'https://raw.githubusercontent.com/falsisdev/anthology/main/assets/logo_1_transparent.png',
+                background: c.poster || 'https://raw.githubusercontent.com/falsisdev/anthology/main/assets/logo_1_transparent.png',
+                genres: ['Film', 'HDFilmIzle'],
+                description: c.title + ' - HDFilmIzle'
+            };
+        });
+        return { metas: metas };
+    } catch (e) {
+        return { metas: [] };
+    }
+}
 
-    # Aynı yayın adresini tekrar yazma
-    unique_entries = []
-    seen_streams = set()
+async function getMeta(args) {
+    try {
+        var rawId = (typeof args === 'string') ? args : (args && args.id ? args.id : '');
+        if (!rawId || !rawId.startsWith('hdfilmizle:')) return { meta: null };
+        var href = decodeURIComponent(rawId.split(':').slice(2).join(':'));
+        var base = BASES[0];
+        for (var i = 0; i < BASES.length; i++) {
+            if (href.indexOf(BASES[i]) === 0) { base = BASES[i]; break; }
+        }
+        var res = await fetchWithTimeout(href, { headers: headersFor(base) }, 15000);
+        if (!res.ok) return { meta: null };
+        var html = await res.text();
+        var titleMatch = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+        var title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : 'HDFilmIzle';
+        var ogImg = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
+        var poster = ogImg ? ogImg[1] : 'https://raw.githubusercontent.com/falsisdev/anthology/main/assets/logo_1_transparent.png';
+        return {
+            meta: {
+                id: rawId, type: 'movie', name: title, poster: poster, background: poster,
+                description: title + ' - HDFilmIzle',
+                genres: ['Film', 'HDFilmIzle'],
+                videos: [{ id: rawId, title: title, released: new Date().toISOString().split('T')[0] }]
+            }
+        };
+    } catch (e) {
+        return { meta: null };
+    }
+}
 
-    for entry in all_entries:
-        lines = entry.strip().splitlines()
-        stream = lines[-1] if lines else ""
+async function getStreams(tmdbIdOrArgs, mediaType) {
+    try {
+        if (typeof tmdbIdOrArgs === 'object' && tmdbIdOrArgs && tmdbIdOrArgs.id) {
+            return getStreams(tmdbIdOrArgs.id, mediaType);
+        }
+        if (typeof tmdbIdOrArgs === 'string' && tmdbIdOrArgs.startsWith('hdfilmizle:movie:')) {
+            var href = decodeURIComponent(tmdbIdOrArgs.split(':').slice(2).join(':'));
+            var b = BASES[0];
+            for (var i = 0; i < BASES.length; i++) {
+                if (href.indexOf(BASES[i]) === 0) { b = BASES[i]; break; }
+            }
+            return await extractStreamsFromFilmPage(href, b);
+        }
 
-        if stream in seen_streams:
-            continue
+        var info = await resolveTmdbInfo(tmdbIdOrArgs);
+        var searchTitles = [info.title, info.origTitle].filter(Boolean);
+        if (searchTitles.length === 0) return [];
 
-        seen_streams.add(stream)
-        unique_entries.append(entry)
+        for (var t = 0; t < searchTitles.length; t++) {
+            var cards = await searchAll(searchTitles[t]);
+            if (!cards || cards.length === 0) continue;
+            var best = pickBest(cards, searchTitles[t], info.year);
+            if (!best) continue;
+            var streams = await extractStreamsFromFilmPage(best.href, best.base);
+            if (streams.length > 0) return streams;
+        }
+        return [];
+    } catch (e) {
+        return [];
+    }
+}
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write("#EXTM3U\n")
-        f.writelines(unique_entries)
+// ── Universal Quality Sorter ──────────────────────────────────────────
+if (typeof getStreams === "function") {
+    var _origGetStreams = getStreams;
+    getStreams = async function() {
+        var res = await _origGetStreams.apply(this, arguments);
+        return sortStreamsByQuality(res);
+    };
+}
 
-    print(f"Bitti. Toplam {len(unique_entries)} benzersiz kayıt yazıldı.")
-
-
-if __name__ == "__main__":
-    main()
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = wrapAll({ getStreams, getMeta, getCatalog }, cfgReady);
+}
+if (typeof globalThis !== 'undefined') {
+    globalThis.getStreams = getStreams;
+    globalThis.getMeta = getMeta;
+    globalThis.getCatalog = getCatalog;
+}
