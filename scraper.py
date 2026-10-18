@@ -16,7 +16,7 @@ function cfgReady() {
 
 /**
  * Anthology - HDFilmIzle Provider (Vip + Ink)
- * https://www.hdfilmizle.vip / https://www.hdfilmizle.ink
+ * https://www.hdfilmizle.live / https://www.hdfilmizle.ink
  * Film arşivi; Vidrame, Vidmoxy ve FastPlay 1080p HLS master akışları (TR/EN altyazı).
  */
 
